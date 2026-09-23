@@ -1,74 +1,54 @@
-import React, { useReducer, useRef, useState } from "react";
-import {
-  createQrInitRequest,
-  createQrPollRequest,
-  parseQrInitResponse,
-  parseQrPollResponse,
-} from "@orbclub/modules/auth/qr";
+import React, { useEffect, useReducer, useRef, useState } from "react";
+import { SiteSignInError, signInWithOrb, tokenExpiresAt } from "./siwo-browser.js";
 
-const DEFAULT_CREDENTIAL_SCOPE = "id";
-const DEFAULT_ORB_QR_INIT_URL = "https://orbapi.xyz/init-sign-in";
-const DEFAULT_ORB_QR_POLL_URL = "https://orbapi.xyz/poll-sign-in";
-const DEFAULT_POLL_INTERVAL_MS = 2_000;
-const CREDENTIAL_SCOPE_OPTIONS = [
-  {
-    value: "id",
-    label: "ID token only",
-    description: "Ask Orb only for identity.",
-  },
-  {
-    value: "id_access",
-    label: "ID + access",
-    description: "Ask for identity and an app access token.",
-  },
-  {
-    value: "id_access_refresh",
-    label: "ID + access + refresh",
-    description: "Ask for identity plus access and refresh tokens.",
-  },
-];
+// The protocol issues no refresh token and the access token lives about ten
+// minutes. If the token carries no readable `exp`, assume that lifetime.
+const FALLBACK_SESSION_MS = 10 * 60 * 1000;
 
 export default function App() {
-  const [state, dispatch] = useReducer(
-    qrLoginReducer,
-    undefined,
-    createInitialLoginState,
-  );
-  const [credentialScope, setCredentialScope] = useState(
-    DEFAULT_CREDENTIAL_SCOPE,
-  );
-  const [sessionScope, setSessionScope] = useState(DEFAULT_CREDENTIAL_SCOPE);
+  const [state, dispatch] = useReducer(loginReducer, undefined, createInitialLoginState);
   const activeController = useRef(null);
+  const isTouch = useCoarsePointer();
+
+  // End the session when its access token does; never show a dead token as signed in.
+  useEffect(() => {
+    const expiresAt = state.session?.expiresAt;
+    if (!expiresAt) return undefined;
+    const expireIfDue = () => {
+      if (Date.now() >= expiresAt) dispatch({ type: "expired" });
+    };
+    const timer = setTimeout(expireIfDue, Math.min(Math.max(0, expiresAt - Date.now()), 2_147_483_647));
+    // Background tabs throttle timers; check again when the tab returns.
+    document.addEventListener("visibilitychange", expireIfDue);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", expireIfDue);
+    };
+  }, [state.session?.expiresAt]);
+
+  useEffect(() => () => activeController.current?.abort(), []);
 
   async function startLogin() {
     activeController.current?.abort();
-
-    const requestedScope = credentialScope;
     const controller = new AbortController();
     activeController.current = controller;
     dispatch({ type: "start" });
 
     try {
-      const session = await connectWithCredentialScope({
-        credentials: requestedScope,
+      const credentials = await signInWithOrb({
         signal: controller.signal,
-        onInit: ({ qrCode, deepLink }) => {
-          dispatch({ type: "init", payload: { qrCode, deepLink } });
-        },
+        onProvisioning: () => dispatch({ type: "provisioning" }),
+        onQr: ({ qrCode, deepLink, expiresAt }) =>
+          dispatch({ type: "qr", payload: { qrCode, deepLink, expiresAt } }),
       });
-
-      if (!controller.signal.aborted) {
-        setSessionScope(requestedScope);
-        dispatch({ type: "success", payload: session });
-      }
+      if (controller.signal.aborted) return;
+      const expiresAt = tokenExpiresAt(credentials.accessToken) ?? Date.now() + FALLBACK_SESSION_MS;
+      if (expiresAt <= Date.now()) throw new SiteSignInError("The access token is already expired.", "invalid");
+      dispatch({ type: "success", payload: { ...credentials, expiresAt } });
     } catch (error) {
-      if (!controller.signal.aborted) {
-        dispatch({ type: "error", error });
-      }
+      if (!controller.signal.aborted) dispatch({ type: "error", error });
     } finally {
-      if (activeController.current === controller) {
-        activeController.current = null;
-      }
+      if (activeController.current === controller) activeController.current = null;
     }
   }
 
@@ -78,14 +58,9 @@ export default function App() {
     dispatch({ type: "reset" });
   }
 
-  const canStart = state.status === "idle" || state.status === "error";
+  const canStart = state.status === "idle" || state.status === "error" || state.status === "expired";
   const isConnecting = state.status === "connecting";
-  const showStart = canStart && !state.session;
-  const showQr = isConnecting || Boolean(state.qrCode);
-  const showStatus = state.status !== "idle";
-  const appClassName = state.session
-    ? "app-shell with-session"
-    : "app-shell single-panel";
+  const appClassName = state.session ? "app-shell with-session" : "app-shell single-panel";
 
   return (
     <main className={appClassName}>
@@ -93,82 +68,44 @@ export default function App() {
         <div className="heading-row">
           <div>
             <p className="eyebrow">Dummy client</p>
-            <h1 id="page-title">Orb QR Login</h1>
+            <h1 id="page-title">Sign in with Orb</h1>
           </div>
-          {showStatus ? (
-            <span className={`status-pill status-${state.status}`}>
-              {state.status}
-            </span>
+          {state.status !== "idle" ? (
+            <span className={`status-pill status-${state.status}`}>{state.status}</span>
           ) : null}
         </div>
 
-        {showStart ? (
-          <fieldset className="scope-picker">
-            <legend>Request</legend>
-            {CREDENTIAL_SCOPE_OPTIONS.map((option) => (
-              <label
-                className="scope-option"
-                key={option.value}
-                htmlFor={`scope-${option.value}`}
-              >
-                <input
-                  checked={credentialScope === option.value}
-                  id={`scope-${option.value}`}
-                  name="credential-scope"
-                  onChange={() => setCredentialScope(option.value)}
-                  type="radio"
-                  value={option.value}
-                />
-                <span>
-                  <strong>{option.label}</strong>
-                  <small>{option.description}</small>
-                </span>
-              </label>
-            ))}
-          </fieldset>
-        ) : null}
-
-        {showQr ? (
+        {isConnecting ? (
           <div className="qr-stage" aria-live="polite">
             {state.qrCode ? (
-              <img className="qr-image" src={state.qrCode} alt="Orb login QR" />
+              <img className="qr-image" src={state.qrCode} alt="Scan with the Orb app to sign in" />
             ) : (
-              <div className="qr-placeholder" aria-hidden="true">
-                QR
-              </div>
+              <div className="qr-placeholder" aria-hidden="true">QR</div>
             )}
           </div>
         ) : null}
 
-        {state.status !== "idle" ? (
-          <p className="state-message">{state.message}</p>
-        ) : null}
-
+        {state.status !== "idle" ? <p className="state-message">{state.message}</p> : null}
         {state.error ? <p className="error-message">{state.error}</p> : null}
 
         <div className="actions">
           {canStart ? (
             <button type="button" className="primary-action" onClick={startLogin}>
-              Start QR login
+              {state.status === "idle" ? "Sign in with Orb" : "Get a new code"}
             </button>
           ) : null}
 
           {isConnecting ? (
-            <button type="button" className="secondary-action" onClick={resetLogin}>
-              Cancel
-            </button>
+            <button type="button" className="secondary-action" onClick={resetLogin}>Cancel</button>
           ) : null}
 
-          {state.deepLink ? (
-            <a className="secondary-action action-link" href={state.deepLink}>
-              Open Orb
-            </a>
+          {/* A phone cannot scan its own screen: offer the deep link on touch devices. */}
+          {isConnecting && state.deepLink && isTouch ? (
+            <a className="secondary-action action-link" href={state.deepLink}>Open Orb app</a>
           ) : null}
 
           {state.status === "authenticated" ? (
-            <button type="button" className="secondary-action" onClick={resetLogin}>
-              Start over
-            </button>
+            <button type="button" className="secondary-action" onClick={resetLogin}>Sign out</button>
           ) : null}
         </div>
       </section>
@@ -177,7 +114,12 @@ export default function App() {
         <section className="session-panel" aria-labelledby="session-title">
           <h2 id="session-title">Session</h2>
           <dl className="session-list">
-            {summarizeSession(state.session, sessionScope).map(([label, value]) => (
+            {[
+              ["Account", state.session.user_id],
+              ["Expires", new Date(state.session.expiresAt).toLocaleTimeString()],
+              ["ID token", state.session.idToken],
+              ["Access token", state.session.accessToken],
+            ].map(([label, value]) => (
               <div className="session-row" key={label}>
                 <dt>{label}</dt>
                 <dd>{value}</dd>
@@ -190,82 +132,48 @@ export default function App() {
   );
 }
 
-async function connectWithCredentialScope({ credentials, signal, onInit }) {
-  throwIfAborted(signal);
-
-  const initRequest = createQrInitRequest({
-    endpoint: DEFAULT_ORB_QR_INIT_URL,
-    credentials,
-  });
-  const initPayload = parseQrInitResponse(
-    await fetchJson(initRequest.url, initRequest.init, signal),
-  );
-
-  onInit?.({ qrCode: initPayload.qrCode, deepLink: initPayload.deepLink });
-
-  while (true) {
-    throwIfAborted(signal);
-
-    const pollRequest = createQrPollRequest({
-      endpoint: DEFAULT_ORB_QR_POLL_URL,
-      secret: initPayload.secret,
-    });
-    const pollPayload = parseQrPollResponse(
-      await fetchJson(pollRequest.url, pollRequest.init, signal),
-    );
-
-    if (requiredTokenReceived(pollPayload, credentials)) {
-      return pollPayload;
-    }
-
-    if (pollPayload.status === "FAILED") {
-      throw new Error("QR login failed.");
-    }
-
-    if (pollPayload.processed === true) {
-      throw new Error("QR login completed without the requested credentials.");
-    }
-
-    await delay(DEFAULT_POLL_INTERVAL_MS, signal);
-  }
+function useCoarsePointer() {
+  const [coarse, setCoarse] = useState(() => window.matchMedia("(pointer: coarse)").matches);
+  useEffect(() => {
+    const media = window.matchMedia("(pointer: coarse)");
+    const update = () => setCoarse(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return coarse;
 }
 
 function createInitialLoginState() {
-  return {
-    status: "idle",
-    message: "Ready to start QR login.",
-  };
+  return { status: "idle", message: "Ready to sign in." };
 }
 
-function qrLoginReducer(state, action) {
+function loginReducer(state, action) {
   switch (action.type) {
     case "start":
+      return { status: "connecting", message: "Preparing sign-in..." };
+    case "provisioning":
       return {
         status: "connecting",
-        message: "Preparing Orb QR login...",
+        message: "Setting up Sign in with Orb for this site (first use can take a few minutes)...",
       };
-    case "init":
+    case "qr":
       return {
-        ...state,
         status: "connecting",
-        message: "Scan with Orb to approve this login.",
+        message: "Scan with the Orb app to approve this sign-in.",
         qrCode: action.payload.qrCode,
         deepLink: action.payload.deepLink,
-        error: undefined,
       };
     case "success":
-      return {
-        ...state,
-        status: "authenticated",
-        message: "QR login approved.",
-        session: action.payload,
-        error: undefined,
-      };
+      return { status: "authenticated", message: "Signed in.", session: action.payload };
+    case "expired":
+      return { status: "expired", message: "Your session expired. Sign in again." };
     case "error":
       return {
-        ...state,
         status: "error",
-        message: "QR login failed.",
+        message:
+          action.error instanceof SiteSignInError && action.error.reason === "expired"
+            ? "This code expired."
+            : "Sign-in failed.",
         error: getErrorMessage(action.error),
       };
     case "reset":
@@ -275,98 +183,7 @@ function qrLoginReducer(state, action) {
   }
 }
 
-function summarizeSession(session, scope) {
-  const rows = [["ID token", session.idToken ?? "Not returned"]];
-
-  if (scope === "id_access" || scope === "id_access_refresh") {
-    rows.push(["Access token", session.accessToken ?? "Not returned"]);
-  }
-
-  if (scope === "id_access_refresh") {
-    rows.push(["Refresh token", session.refreshToken ?? "Not returned"]);
-  }
-
-  if (session.authenticationId) {
-    rows.push(["Authentication ID", session.authenticationId]);
-  }
-
-  return rows;
-}
-
-function requiredTokenReceived(session, scope) {
-  if (session.processed !== true || !isNonBlankString(session.idToken)) {
-    return false;
-  }
-
-  if (scope === "id_access") {
-    return isNonBlankString(session.accessToken);
-  }
-
-  if (scope === "id_access_refresh") {
-    return (
-      isNonBlankString(session.accessToken) &&
-      isNonBlankString(session.refreshToken)
-    );
-  }
-
-  return true;
-}
-
-async function fetchJson(input, init, signal) {
-  throwIfAborted(signal);
-
-  const response = await fetch(input, { ...init, signal });
-  if (!response.ok) {
-    throw new Error(`QR request failed (${response.status}).`);
-  }
-
-  return await response.json();
-}
-
-async function delay(ms, signal) {
-  await new Promise((resolve, reject) => {
-    const timeout = globalThis.setTimeout(() => {
-      cleanup();
-      resolve();
-    }, ms);
-
-    const onAbort = () => {
-      cleanup();
-      reject(new Error("QR login was cancelled."));
-    };
-
-    const cleanup = () => {
-      globalThis.clearTimeout(timeout);
-      signal?.removeEventListener("abort", onAbort);
-    };
-
-    if (signal?.aborted) {
-      onAbort();
-      return;
-    }
-
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
 function getErrorMessage(error) {
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
-
-  return "Unknown QR login error";
-}
-
-function isNonBlankString(value) {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function throwIfAborted(signal) {
-  if (signal?.aborted) {
-    throw new Error("QR login was cancelled.");
-  }
+  if (error instanceof Error && error.message.trim()) return error.message;
+  return "Unknown sign-in error";
 }
